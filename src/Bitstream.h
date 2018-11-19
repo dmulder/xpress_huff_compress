@@ -1,5 +1,6 @@
 // ms-compress: implements Microsoft compression algorithms
 // Copyright (C) 2012  Jeffrey Bush  jeff@coderforlife.com
+// Copyright (C) 2018 David Mulder <dmulder@suse.com>
 //
 // This library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -20,133 +21,98 @@
 // It reads uint16s for bits and 16 bits can be reliably read at a time.
 // These are designed for speed and perform few checks. The burden of checking is on the caller.
 // See the functions for assumptions they make that should be checked by the caller (asserts check
-// these in the functions as well). Note that this->bits is >= 16 unless near the very end of the
+// these in the functions as well). Note that ctx->bits is >= 16 unless near the very end of the
 // stream.
 
 #ifndef MSCOMP_BITSTREAM_H
 #define MSCOMP_BITSTREAM_H
-#include "internal.h"
 
-WARNINGS_PUSH()
-WARNINGS_IGNORE_ASSIGNMENT_OPERATOR_NOT_GENERATED()
+#if defined(MSCOMP_WITH_UNALIGNED_ACCESS)
+        #define GET_UINT16_RAW(x)               (*(const uint16_t*)(x))
+        #define GET_UINT32_RAW(x)               (*(const uint32_t*)(x))
+        #define SET_UINT16_RAW(x,val)   (*(uint16_t*)(x) = (uint16_t)(val))
+        #define SET_UINT32_RAW(x,val)   (*(uint32_t*)(x) = (uint32_t)(val))
+        #if defined(MSCOMP_LITTLE_ENDIAN)
+                #define GET_UINT16(x)           GET_UINT16_RAW(x)
+                #define GET_UINT32(x)           GET_UINT32_RAW(x)
+                #define SET_UINT16(x,val)       SET_UINT16_RAW(x,val)
+                #define SET_UINT32(x,val)       SET_UINT32_RAW(x,val)
+        #elif defined(MSCOMP_BIG_ENDIAN)
+                // These could also use the without-unaligned-access versions always
+                #define GET_UINT16(x)           byte_swap(*(const uint16_t*)(x))
+                #define GET_UINT32(x)           byte_swap(*(const uint32_t*)(x))
+                #define SET_UINT16(x,val)       (*(uint16_t*)(x) = byte_swap((uint16_t)(val)))
+                #define SET_UINT32(x,val)       (*(uint32_t*)(x) = byte_swap((uint32_t)(val)))
+        #endif
+#else // if MSCOMP_WITHOUT_UNALIGNED_ACCESS:
+        // When not using unaligned access, nothing needs to be done for different endians
+        #define GET_UINT16_RAW(x)               (((uint8_t*)(x))[0]|(((uint8_t*)(x))[1]<<8))
+        #define GET_UINT32_RAW(x)               (((uint8_t*)(x))[0]|(((uint8_t*)(x))[1]<<8)|(((uint8_t*)(x))[2]<<16)|(((uint8_t*)(x))[3]<<24))
+        #define SET_UINT16_RAW(x,val)   (((uint8_t*)(x))[0]=(uint8_t)(val), ((uint8_t*)(x))[1]=(uint8_t)((val)>>8))
+        #define SET_UINT32_RAW(x,val)   (((uint8_t*)(x))[0]=(uint8_t)(val), ((uint8_t*)(x))[1]=(uint8_t)((val)>>8), ((uint8_t*)(x))[2]=(uint8_t)((val)>>16), ((uint8_t*)(x))[3]=(uint8_t)((val)>>24))
+        #define GET_UINT16(x)                   GET_UINT16_RAW(x)
+        #define GET_UINT32(x)                   GET_UINT32_RAW(x)
+        #define SET_UINT16(x,val)               SET_UINT16_RAW(x,val)
+        #define SET_UINT32(x,val)               SET_UINT32_RAW(x,val)
+#endif
 
-////////// Input Bitstream ////////////////////////////////////////////////////
-class InputBitstream 
+typedef struct
 {
-private:
-	const_bytes in;
-	const const_bytes in_end;
-	uint32_t mask;		// The next bits to be read/written in the bitstream
-	uint_fast8_t bits;	// The number of bits in mask that are valid
-public:
-	// Create an input bitstream
-	//   Assumption: in != NULL && in_end - in >= 4
-	INLINE InputBitstream(const_bytes in, const const_bytes in_end) : in(in+4), in_end(in_end), mask((GET_UINT16(in) << 16) | GET_UINT16(in+2)), bits(32) { assert(in); assert(in_end - in >= 4); }
-	
-	///// Basic Properties /////
-	FORCE_INLINE const_bytes RawStream() { return this->in; }
-	FORCE_INLINE uint_fast8_t AvailableBits() const { return this->bits; }
-	// Get the remaining number of raw bytes (disregards pre-read bits)
-	FORCE_INLINE size_t RemainingRawBytes() const { return this->in_end - this->in; }
-
-	///// Peeking Functions /////
-	// Peek at the next n bits of the stream
-	//   Assumption: n <= 16 && n <= this->bits
-	FORCE_INLINE uint32_t Peek(const uint_fast8_t n) const { ASSERT_ALWAYS(n <= 16); assert(n <= this->bits); return (this->mask >> 16) >> (16 - n); } // we can't do a single shift because if n is 0 then a shift by 32 is undefined
-	// Check if all pre-read bits are 0, essentially Peek(AvailableBits()) == 0 (except that AvailableBits can be larger than 16, which Peek does not allow)
-	// If there are 0 pre-read bits, returns true
-	FORCE_INLINE bool MaskIsZero() const { return this->bits == 0 || (this->mask>>(32-this->bits)) == 0; }
-	
-	///// Skipping Functions /////
-	// Skip the next n bits of the stream
-	//   Assumption: n <= 16 && n <= this->bits
-	INLINE void Skip(const uint_fast8_t n)
-	{
-		ASSERT_ALWAYS(n <= 16); ASSERT_ALWAYS(n <= this->bits);
-		this->mask <<= n;
-		this->bits -= n;
-		if (this->bits < 16 && this->in + 2 <= this->in_end)
-		{
-			this->mask |= GET_UINT16(this->in) << (16 - this->bits);
-			this->bits |= 0x10; //this->bits += 16;
-			this->in += 2;
-		}
-	}
-	// Skip the next n bits of the stream without bounds checks
-	//   Assumption: n <= 16
-	INLINE void Skip_Fast(const uint_fast8_t n)
-	{
-		ASSERT_ALWAYS(n <= 16);
-		this->mask <<= n;
-		this->bits -= n;
-		if (this->bits < 16)
-		{
-			this->mask |= GET_UINT16(this->in) << (16 - this->bits);
-			this->bits |= 0x10; //this->bits += 16;
-			this->in += 2;
-		}
-	}
-	
-	///// Reading Functions /////
-	// Read the next n bits of the stream, where n <= 16 (essentially Peek(n); Skip(n))
-	//   Assumption: n <= 16 && n <= this->bits
-	FORCE_INLINE uint32_t ReadBits(const uint_fast8_t n) { const uint32_t x = this->Peek(n); this->Skip(n); return x; }
-	
-	///// Fast Reading Functions /////
-	// Equivalent to the reading functions but do not do bounds checks
-	// Read the next n bits of the stream, where n <= 16 (essentially Peek(n); Skip_Fast(n))
-	//   Assumption: n <= 16
-	FORCE_INLINE uint32_t ReadBits_Fast(const uint_fast8_t n) { const uint32_t x = this->Peek(n); this->Skip_Fast(n); return x; }
-	
-	///// Raw Reading Functions /////
-	// Get the next integer from the underlying stream, not the pre-read bits.
-	// These assume that this->RemainingRawBytes() >= sizeof(type)
-	FORCE_INLINE byte     ReadRawByte()   { assert(this->in + 1 <= this->in_end); return *this->in++; }
-	FORCE_INLINE uint16_t ReadRawUInt16() { assert(this->in + 2 <= this->in_end); const uint16_t x = GET_UINT16(this->in); this->in += 2; return x; }
-	FORCE_INLINE uint32_t ReadRawUInt32() { assert(this->in + 4 <= this->in_end); const uint32_t x = GET_UINT32(this->in); this->in += 4; return x; }
-};
-
-
-////////// Output Bitstream ///////////////////////////////////////////////////
-class OutputBitstream
-{
-private:
-	bytes out;
+	uint8_t* out;
 	uint16_t* pntr[2];	// the uint16's to write the data in mask to when there are enough bits
 	uint32_t mask;		// The next bits to be read/written in the bitstream
 	uint_fast8_t bits;	// The number of bits in mask that are valid
-public:
-	INLINE OutputBitstream(bytes out) : out(out+4), mask(0), bits(0)
-	{
-		assert(out);
-		this->pntr[0] = (uint16_t*)(out);
-		this->pntr[1] = (uint16_t*)(out+2);
-	}
-	FORCE_INLINE bytes RawStream() { return this->out; }
-	INLINE void WriteBits(uint32_t b, uint_fast8_t n)
-	{
-		assert(n <= 16);
-		this->mask |= b << (32 - (this->bits += n));
-		if (this->bits > 16)
-		{
-			SET_UINT16(this->pntr[0], this->mask >> 16);
-			this->mask <<= 16;
-			this->bits &= 0xF; //this->bits -= 16;
-			this->pntr[0] = this->pntr[1];
-			this->pntr[1] = (uint16_t*)(this->out);
-			this->out += 2;
-		}
-	}
-	FORCE_INLINE void WriteRawByte(byte x)       { *this->out++ = x; }
-	FORCE_INLINE void WriteRawUInt16(uint16_t x) { SET_UINT16(this->out, x); this->out += 2; }
-	FORCE_INLINE void WriteRawUInt32(uint32_t x) { SET_UINT32(this->out, x); this->out += 4; }
-	FORCE_INLINE void Finish()
-	{
-		SET_UINT16(this->pntr[0], this->mask >> 16); // if !bits then mask is 0 anyways
-		SET_UINT16_RAW(this->pntr[1], 0);
-	}
-};
+} OutputBitstream;
 
-WARNINGS_POP()
+void OutputBitstream_init(OutputBitstream *ctx, uint8_t* out)
+{
+	ctx->out = out+4;
+	ctx->mask = 0;
+	ctx->bits = 0;
+	ctx->pntr[0] = (uint16_t*)(out);
+	ctx->pntr[1] = (uint16_t*)(out+2);
+}
+
+uint8_t* RawStream(OutputBitstream *ctx)
+{
+	return ctx->out;
+}
+
+void WriteBits(OutputBitstream *ctx, uint32_t b, uint_fast8_t n)
+{
+	ctx->mask |= b << (32 - (ctx->bits += n));
+	if (ctx->bits > 16)
+	{
+		SET_UINT16(ctx->pntr[0], ctx->mask >> 16);
+		ctx->mask <<= 16;
+		ctx->bits &= 0xF; //ctx->bits -= 16;
+		ctx->pntr[0] = ctx->pntr[1];
+		ctx->pntr[1] = (uint16_t*)(ctx->out);
+		ctx->out += 2;
+	}
+}
+
+void WriteRawByte(OutputBitstream *ctx, uint8_t x)
+{
+	*ctx->out++ = x;
+}
+
+void WriteRawUInt16(OutputBitstream *ctx, uint16_t x)
+{
+	SET_UINT16(ctx->out, x);
+	ctx->out += 2;
+}
+
+void WriteRawUInt32(OutputBitstream *ctx, uint32_t x)
+{
+	SET_UINT32(ctx->out, x);
+	ctx->out += 4;
+}
+
+void Finish(OutputBitstream *ctx)
+{
+	SET_UINT16(ctx->pntr[0], ctx->mask >> 16); // if !bits then mask is 0 anyways
+	SET_UINT16_RAW(ctx->pntr[1], 0);
+}
 
 #endif
